@@ -76,59 +76,24 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
-    def test_dpard_offline_example(self):
-        from pathlib import Path
-
-        repo = Path(__file__).resolve().parents[2]
-        cfg = load_config(
-            str(
-                repo
-                / "examples/configs/offline/colocated/qwen3-4b-dspark-dpard-offline.yaml"
-            )
-        )
-        self.assertEqual(cfg.mode, "offline")
-        self.assertEqual(cfg.deployment.mode, "local_colocated")
-        from specforge.training.model_loading import resolve_draft_config
-
-        cfg.model.draft_model_config = str(repo / cfg.model.draft_model_config)
-        provider = (
-            builtin_algorithm_registry().resolve("dspark").providers.model.draft_config
-        )
-        draft = resolve_draft_config(cfg, provider=provider)
-        self.assertEqual(draft.block_size, 16)
-        self.assertEqual(draft.num_hidden_layers, 3)
-        self.assertEqual(draft.layer_types, ["full_attention"] * 3)
-        self.assertEqual(draft.dflash_config["target_layer_ids"], [1, 17, 33])
-        self.assertEqual(cfg.training.loss_type, "dpard")
-        self.assertEqual(cfg.training.num_anchors, 512)
-        self.assertIsNone(cfg.training.max_steps)
-        self.assertEqual(cfg.training.num_epochs, 6)
-        self.assertIsNone(cfg.training.loss_decay_gamma)
-
-    def test_dpard_requires_dspark_and_replaces_ce_l1(self):
-        from specforge.config.schema import TrainingConfig
-
-        options = dict(
-            strategy="dspark",
-            loss_type="dpard",
-            dpard_alpha=0.5,
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-        )
-        cfg = TrainingConfig(**options)
-        self.assertEqual(cfg.loss_type, "dpard")
-        self.assertEqual(cfg.dpard_alpha, 0.5)
-        for override in [
-            {"strategy": "dflash"},
-            {"dspark_ce_loss_alpha": 0.1},
-            {"dspark_l1_loss_alpha": 0.9},
-            {"dpard_alpha": 0.0},
-            {"dpard_alpha": 1.0},
-            {"dpard_alpha": float("nan")},
+    def test_dpard_is_a_dflash_objective(self):
+        payload = _online_payload("dflash")
+        payload["training"].update(loss_type="dpard", dpard_alpha=0.5)
+        config = Config.model_validate(payload)
+        self.assertEqual(config.training.loss_type, "dpard")
+        self.assertFalse(config.training.dflash_normalize_by_anchors)
+        for changes in (
+            {"strategy": "dspark"},
+            {"strategy": "eagle3"},
             {"lk_loss_type": "tv"},
-        ]:
-            with self.subTest(override=override), self.assertRaises(ValidationError):
-                TrainingConfig(**{**options, **override})
+            {"dpard_alpha": -0.1},
+            {"dpard_alpha": 1.1},
+        ):
+            with self.subTest(changes=changes):
+                invalid = copy.deepcopy(payload)
+                invalid["training"].update(changes)
+                with self.assertRaises(ValidationError):
+                    Config.model_validate(invalid)
 
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
@@ -146,6 +111,24 @@ class ConfigSchemaTest(unittest.TestCase):
 
         self.assertIsNone(config.training.max_steps)
         self.assertIsNone(config.training.total_steps)
+
+    def test_external_cuda_transport_is_validated_after_environment_resolution(self):
+        payload = _online_payload()
+        payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        payload["deployment"]["disaggregated"]["mooncake_protocol"] = "tcp"
+        Config.model_validate(payload)  # MOONCAKE_PROTOCOL may override TCP.
+        payload["deployment"]["disaggregated"]["mooncake_protocol"] = "rdma"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "cuda")
+        # a worker role config learns the transport from MOONCAKE_PROTOCOL only;
+        # the store factory re-checks it, so no typed protocol is accepted here
+        payload["deployment"]["disaggregated"].pop("mooncake_protocol")
+        Config.model_validate(payload)
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "pinned"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "pinned")
+        self.assertEqual(cfg.deployment.disaggregated.receive_pool_bytes, 8 << 30)
 
     def test_fsdp_sharding_is_typed(self):
         payload = copy.deepcopy(MINIMAL)
@@ -359,6 +342,22 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValidationError, "trainer role"):
             Config.model_validate(producer_payload)
+
+    def test_capture_server_gpu_put_requires_an_rdma_transport(self):
+        payload = _managed_local_payload(ep_size=1)
+        managed = payload["deployment"]["disaggregated"]["managed_local"]
+        managed["capture_servers"][0]["gpu_put"] = True
+        with self.assertRaisesRegex(ValidationError, "rdma"):
+            Config.model_validate(payload)
+        managed["mooncake"] = {"protocol": "rdma", "rdma_devices": "mlx5_0"}
+        cfg = Config.model_validate(payload)
+        server = cfg.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertTrue(server.gpu_put)
+        managed["capture_servers"][0].pop("gpu_put")
+        cfg = Config.model_validate(payload)
+        self.assertIsNone(
+            cfg.deployment.disaggregated.managed_local.capture_servers[0].gpu_put
+        )
 
     def test_unknown_backend_rejected(self):
         bad = {**MINIMAL, "model": {**MINIMAL["model"], "target_backend": "vllm"}}

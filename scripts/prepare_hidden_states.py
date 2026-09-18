@@ -107,6 +107,12 @@ def parse_args():
         help="Offline draft strategy (default: eagle3)",
     )
     model_group.add_argument(
+        "--loss-type",
+        choices=("dflash", "dpace", "dpard"),
+        default="dflash",
+        help="DFlash training loss; dpard also captures final teacher states",
+    )
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         default=None,
@@ -329,7 +335,10 @@ def resolve_offline_capture_plan(
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        training={
+            "strategy": strategy,
+            "loss_type": getattr(args, "loss_type", "dflash"),
+        },
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(

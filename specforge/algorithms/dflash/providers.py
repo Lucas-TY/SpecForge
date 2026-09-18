@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -9,8 +10,12 @@ from specforge.algorithms.common.defaults import (
     no_missing_checkpoint_keys,
 )
 from specforge.algorithms.common.hidden_states_data import (
+    DSPARK_NORMALIZER_ID,
     NORMALIZER_ID,
     build_collator,
+    build_dspark_collator,
+    build_dspark_offline_normalizer,
+    build_dspark_offline_reader,
     build_offline_normalizer,
     build_offline_reader,
 )
@@ -64,7 +69,12 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_attention_backend": str(training_model.attention_backend),
         "dflash_num_anchors": int(training_model.num_anchors),
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
-        "dflash_loss_type": str(training_model.loss_type),
+        "dflash_loss_type": (
+            "dflash-anchor"
+            if training_model.loss_type == "dflash"
+            and getattr(training_model, "normalize_by_anchors", False)
+            else str(training_model.loss_type)
+        ),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
         "dflash_lk_loss_type": training_model.lk_loss_type,
         "dflash_kl_scale": float(training_model.kl_scale),
@@ -161,6 +171,45 @@ def needs_input_tools(config, draft_model):
     return dflash_needs_input_tools(config, draft_model)
 
 
+def resolve_for_config(config, registration):
+    """Require final teacher states only for D-PARD, preserving legacy data."""
+    if config.training.loss_type != "dpard":
+        return registration
+    contracts = []
+    for contract in registration.spec.feature_contracts:
+        required = contract.required_tensors | {"target_last_hidden_states"}
+        if contract.mode is FeatureMode.OFFLINE:
+            contract = replace(
+                contract,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+                storage=replace(
+                    contract.storage,
+                    required_tensors=required,
+                    normalizer=DSPARK_NORMALIZER_ID,
+                ),
+            )
+        contracts.append(replace(contract, required_tensors=required))
+    offline = tuple(
+        replace(
+            provider,
+            normalizer_id=DSPARK_NORMALIZER_ID,
+            capture_layout=replace(
+                provider.capture_layout,
+                last_hidden_feature="target_last_hidden_states",
+            ),
+            build_reader=partial(build_dspark_offline_reader, ALGORITHM_NAME),
+            build_normalizer=build_dspark_offline_normalizer,
+            build_collator=build_dspark_collator,
+        )
+        for provider in registration.providers.offline
+    )
+    return make_registration(
+        replace(registration.spec, feature_contracts=tuple(contracts)),
+        replace(registration.providers, offline=offline),
+    )
+
+
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
     return AlgorithmSpec(
@@ -197,6 +246,7 @@ def algorithm_providers() -> AlgorithmProviders:
     collator = build_collator
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
+        resolve_for_config=resolve_for_config,
         step=StepProvider(
             build=build_step,
             options=empty_options,

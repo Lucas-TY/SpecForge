@@ -1,86 +1,77 @@
-"""D-PARD backward through the native DSpark model and provider."""
-
-import tempfile
 import unittest
-from pathlib import Path
 
 import torch
+from torch import nn
+from transformers import Qwen3Config
+
+from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+from specforge.modeling.draft.dflash import DFlashDraftModel
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestDPardModel(unittest.TestCase):
-    def test_b16_bf16_backward(self):
-        from specforge.algorithms.model_providers import build_dspark_model
-        from specforge.config import Config
-        from tests.test_runtime import _fixtures as fx
-
-        with tempfile.TemporaryDirectory(prefix="dpard_test_") as workdir:
-            base, width = fx.build_dspark(
-                workdir,
-                hidden=64,
-                draft_layers=3,
-                block_size=16,
-                num_anchors=3,
-                attention_backend="sdpa",
+class DPardForwardTest(unittest.TestCase):
+    def check_forward(self, device, dtype):
+        torch.manual_seed(42)
+        config = Qwen3Config(
+            architectures=["DFlashDraftModel"],
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=3,
+            num_target_layers=36,
+            head_dim=8,
+            max_position_embeddings=128,
+            vocab_size=64,
+            layer_types=["full_attention"] * 3,
+            dflash_config={"block_size": 16, "target_layer_ids": [1, 17, 33]},
+        )
+        config._attn_implementation = "sdpa"
+        subject = OnlineDFlashModel(
+            DFlashDraftModel(config),
+            nn.Linear(32, 64, bias=False).requires_grad_(False),
+            nn.Embedding(64, 32).requires_grad_(False),
+            mask_token_id=63,
+            block_size=16,
+            num_anchors=2,
+            objective_chunk_blocks=1,
+            attention_backend="sdpa",
+            loss_type="dpard",
+        ).to(device=device, dtype=dtype)
+        ids = torch.randint(0, 63, (2, 40), device=device)
+        features = torch.randn(2, 40, 96, device=device, dtype=dtype)
+        teacher = torch.randn(2, 40, 32, device=device, dtype=dtype)
+        mask = torch.ones_like(ids, dtype=torch.float)
+        values = []
+        for detailed in (False, True):
+            subject.zero_grad(set_to_none=True)
+            torch.manual_seed(7)
+            loss, accuracy, metrics = subject(
+                ids,
+                features,
+                mask,
+                target_last_hidden_states=teacher,
+                collect_detailed_metrics=detailed,
             )
-            cfg = Config.model_validate(
-                {
-                    "model": {
-                        "target_model_path": str(Path(workdir) / "dspark_target"),
-                        "mask_token_id": 0,
-                    },
-                    "data": {"hidden_states_path": workdir},
-                    "training": {
-                        "strategy": "dspark",
-                        "loss_type": "dpard",
-                        "dpard_alpha": 0.5,
-                        "dspark_ce_loss_alpha": 0.0,
-                        "dspark_l1_loss_alpha": 0.0,
-                        "attention_backend": "sdpa",
-                        "num_anchors": 3,
-                        "objective_chunk_blocks": 1,
-                    },
-                }
-            )
-            model = build_dspark_model(cfg, base.draft_model, None, None, None).model
-            self.assertEqual(model.loss_type, "dpard")
-            ids = torch.randint(1, 20, (2, 24), device="cuda")
-            mask = torch.ones_like(ids, dtype=torch.float32)
-            mask[1, 17:] = 0
-            loss, _, metrics = model(
-                input_ids=ids,
-                loss_mask=mask,
-                hidden_states=torch.randn(
-                    2, 24, width, device="cuda", dtype=torch.bfloat16
-                ),
-                target_last_hidden_states=torch.randn(
-                    2, 24, 64, device="cuda", dtype=torch.bfloat16
-                ),
-            )
-            loss.backward()
             self.assertTrue(torch.isfinite(loss))
-            gradients = {
-                name: p.grad
-                for name, p in model.draft_model.named_parameters()
-                if p.grad is not None
-            }
-            self.assertTrue(gradients)
-            self.assertTrue(all(torch.isfinite(g).all() for g in gradients.values()))
-            for component in ["markov", "confidence", "layers"]:
-                self.assertTrue(
-                    any(
-                        component in name and g.norm() > 0
-                        for name, g in gradients.items()
-                    ),
-                    component,
-                )
-            credit, count = metrics["ratio_metrics"]["dpard_credit_position"]
-            self.assertEqual(tuple(credit.shape), (16,))
-            self.assertTrue(torch.isfinite(credit).all())
-            self.assertTrue((credit >= 0).all())
-            self.assertTrue((count >= 0).all())
-            num, den = metrics["ratio_metrics"]["dpard_loss"]
-            self.assertGreater(float(den), 0.0)
-            _, confidence_den = metrics["ratio_metrics"]["confidence_loss"]
-            torch.testing.assert_close(den, confidence_den)
-            self.assertTrue(torch.isfinite(num))
+            self.assertTrue(torch.isfinite(accuracy))
+            loss.backward()
+            grads = [
+                p.grad for p in subject.draft_model.parameters() if p.grad is not None
+            ]
+            self.assertTrue(grads)
+            self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+            self.assertGreater(sum(g.float().abs().sum().item() for g in grads), 0)
+            self.assertTrue(all(p.grad is None for p in subject.lm_head.parameters()))
+            values.append(loss.detach())
+        torch.testing.assert_close(*values)
+
+    def test_b16_forward_backward(self):
+        self.check_forward("cpu", torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_b16_bf16_forward_backward(self):
+        self.check_forward("cuda", torch.bfloat16)
+
+
+if __name__ == "__main__":
+    unittest.main()

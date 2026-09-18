@@ -325,184 +325,23 @@ def _naive_dflash_loss(neg_log_q, binary_mask, gamma):
     return (neg_log_q * weight).sum() / weight.sum()
 
 
+def _sequence_balanced_anchor_terms(per_token_loss, loss_weights, binary_mask):
+    valid_anchors = (binary_mask > 0).any(dim=-1)
+    anchor_counts = valid_anchors.sum(dim=1).to(per_token_loss.dtype)
+    sequence_numerators = (per_token_loss * loss_weights).sum(dim=(1, 2))
+    valid_sequences = anchor_counts > 0
+    normalized_sequence_numerators = torch.where(
+        valid_sequences,
+        sequence_numerators / anchor_counts.clamp_min(1.0),
+        torch.zeros_like(sequence_numerators),
+    )
+    return (
+        normalized_sequence_numerators.sum(),
+        valid_sequences.sum().to(per_token_loss.dtype),
+    )
+
+
 class TestDFlashLosses(unittest.TestCase):
-    def test_dpard_b16_matches_continuation_actor_and_cumulative_confidence(self):
-        torch.manual_seed(42)
-        logits = torch.randn(2, 2, 16, 11, dtype=torch.double, requires_grad=True)
-        target_logits = torch.randn_like(logits, requires_grad=True)
-        conf = torch.randn(2, 2, 16, dtype=torch.double, requires_grad=True)
-        mask = torch.ones(2, 2, 16, dtype=torch.bool)
-        mask[0, 1, 9:] = False
-        mask[1, 1] = False
-        model = _make_dspark_model(
-            logits,
-            torch.zeros(2, 2, dtype=torch.long),
-            torch.ones(2, 2, dtype=torch.bool),
-            draft_model=_FixedDSparkDraft(4, conf),
-            lm_head=_DualFixedHead(logits, target_logits),
-            loss_type="dpard",
-            dpard_alpha=0.25,
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-            objective_chunk_blocks=0,
-        )
-        with patch.object(
-            torch, "softmax", side_effect=AssertionError("duplicate softmax")
-        ):
-            loss, metrics = model._compute_dspark_loss(
-                output_hidden=torch.zeros(2, 32, 4, dtype=torch.double),
-                target_ids=torch.zeros(2, 2, 16, dtype=torch.long),
-                eval_mask=mask,
-                prev_token_ids=torch.zeros(2, 2, 16, dtype=torch.long),
-                safe_label_indices=torch.ones(2, 2, 16, dtype=torch.long),
-                target_last_hidden_states=torch.zeros(2, 2, 4, dtype=torch.double),
-            )
-        logp, logq = (
-            target_logits.float().log_softmax(-1),
-            logits.float().log_softmax(-1),
-        )
-        actor = -2.0 * torch.logsumexp((logp + logq) / 2, dim=-1)
-        with torch.no_grad():
-            acceptance = torch.minimum(logp.exp(), logq.exp()).sum(-1)
-            credit = torch.zeros_like(acceptance)
-            for b in range(2):
-                for block in range(2):
-                    prefix = 1.0
-                    for end in range(int(mask[b, block].sum())):
-                        prefix *= 0.25 + 0.75 * acceptance[b, block, end]
-                        credit[b, block, : end + 1] += prefix
-            masked_acceptance = torch.where(
-                mask, acceptance, torch.ones_like(acceptance)
-            )
-            reach = torch.ones_like(acceptance)
-            reach[..., 1:] = torch.cumprod(masked_acceptance[..., :-1], dim=-1)
-            confidence_weights = reach * mask
-        bce = F.binary_cross_entropy_with_logits(
-            conf.float(), acceptance, reduction="none"
-        )
-        valid_blocks = mask.any(dim=-1).float().sum()
-        want = (actor * credit).sum() / valid_blocks + (
-            bce * confidence_weights
-        ).sum() / valid_blocks
-        torch.testing.assert_close(loss.float(), want, atol=1e-6, rtol=1e-6)
-        grad, conf_grad, target_grad = torch.autograd.grad(
-            loss, (logits, conf, target_logits), allow_unused=True
-        )
-        tilted = ((logp + logq) / 2).softmax(-1)
-        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / valid_blocks
-        torch.testing.assert_close(grad.float(), expected_grad, atol=1e-6, rtol=1e-5)
-        expected_conf_grad = (
-            (conf.float().sigmoid() - acceptance) * confidence_weights / valid_blocks
-        )
-        torch.testing.assert_close(conf_grad.float(), expected_conf_grad)
-        num, den = metrics["ratio_metrics"]["dpard_loss"]
-        torch.testing.assert_close(
-            num / den,
-            (actor.detach() * credit).sum() / valid_blocks,
-            check_dtype=False,
-        )
-        confidence_num, confidence_den = metrics["ratio_metrics"]["confidence_loss"]
-        torch.testing.assert_close(
-            confidence_num / confidence_den,
-            (bce.detach() * confidence_weights).sum() / valid_blocks,
-            check_dtype=False,
-        )
-        self.assertIsNone(target_grad)
-
-    def test_dpard_pools_shared_valid_block_denominator(self):
-        import torch.distributed as dist
-
-        model = _make_dspark_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            draft_model=_LearnableDSparkDraft(4).double(),
-            lm_head=nn.Linear(4, self.logits.shape[-1], bias=False).double(),
-            loss_type="dpard",
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-        )
-        inputs = dict(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-            target_last_hidden_states=torch.randn_like(self.hidden_states),
-        )
-        _, _, metrics = model(**inputs)
-        actor_num, actor_valid_blocks = metrics["ratio_metrics"]["dpard_loss"]
-        conf_num, conf_den = metrics["ratio_metrics"]["confidence_loss"]
-        torch.testing.assert_close(actor_valid_blocks, conf_den)
-        with (
-            patch.object(dist, "is_available", return_value=True),
-            patch.object(dist, "is_initialized", return_value=True),
-            patch.object(dist, "get_world_size", return_value=2),
-            patch.object(dist, "all_reduce", side_effect=lambda t, **kw: t.add_(7.0)),
-        ):
-            loss, _, _ = model(**inputs)
-        expected = 2 * (actor_num + conf_num) / (conf_den + 7)
-        torch.testing.assert_close(loss, expected, check_dtype=False)
-
-    def test_dpard_chunking_matches_full_loss_and_gradient(self):
-        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
-        options = dict(
-            loss_type="dpard",
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-        )
-        full = _make_dspark_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            draft_model=_LearnableDSparkDraft(4).double(),
-            lm_head=head,
-            objective_chunk_blocks=0,
-            **options,
-        )
-        chunked = _make_dspark_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            draft_model=_LearnableDSparkDraft(4).double(),
-            lm_head=copy.deepcopy(head),
-            objective_chunk_blocks=1,
-            **options,
-        )
-        chunked.load_state_dict(full.state_dict())
-        inputs = dict(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-            target_last_hidden_states=torch.randn_like(self.hidden_states),
-        )
-        loss, _, metrics = full(**inputs)
-        chunk_loss, _, chunk_metrics = chunked(**inputs)
-        torch.testing.assert_close(loss, chunk_loss)
-        for name, values in metrics["ratio_metrics"].items():
-            for actual, expected in zip(chunk_metrics["ratio_metrics"][name], values):
-                torch.testing.assert_close(actual, expected)
-        loss.backward()
-        chunk_loss.backward()
-        torch.testing.assert_close(
-            full.draft_model.signal.grad, chunked.draft_model.signal.grad
-        )
-
-    def test_dpard_requires_teacher_without_confidence(self):
-        model = _make_dspark_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            loss_type="dpard",
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-            dspark_confidence_head_alpha=0.0,
-        )
-        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
-            model(
-                input_ids=self.input_ids,
-                hidden_states=self.hidden_states,
-                loss_mask=self.loss_mask,
-            )
-
     def setUp(self):
         (
             self.logits,
@@ -617,7 +456,12 @@ class TestDFlashLosses(unittest.TestCase):
         got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
         effective_weight = weight * self.binary_mask
-        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
+        numerator, denominator = _sequence_balanced_anchor_terms(
+            self.neg_log_q,
+            effective_weight,
+            self.binary_mask,
+        )
+        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_dpace_tv_uses_dynamic_position_weights(self):
@@ -629,7 +473,12 @@ class TestDFlashLosses(unittest.TestCase):
         )
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
         effective_weight = weight * self.binary_mask
-        want = ((1.0 - self.q) * effective_weight).sum() / effective_weight.sum()
+        numerator, denominator = _sequence_balanced_anchor_terms(
+            1.0 - self.q,
+            effective_weight,
+            self.binary_mask,
+        )
+        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_cumulative_confidence_ablation_matches_naive_reference(self):
@@ -644,7 +493,12 @@ class TestDFlashLosses(unittest.TestCase):
             "dpace-cumulative-confidence-only",
         )
         effective_weight = weight * self.binary_mask
-        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
+        numerator, denominator = _sequence_balanced_anchor_terms(
+            self.neg_log_q,
+            effective_weight,
+            self.binary_mask,
+        )
+        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_continuation_value_ablation_matches_naive_reference(self):
@@ -659,10 +513,15 @@ class TestDFlashLosses(unittest.TestCase):
             "dpace-continuation-value-only",
         )
         effective_weight = weight * self.binary_mask
-        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
+        numerator, denominator = _sequence_balanced_anchor_terms(
+            self.neg_log_q,
+            effective_weight,
+            self.binary_mask,
+        )
+        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
-    def test_dpace_loss_reduces_by_effective_token_weight(self):
+    def test_dpace_loss_reduces_by_sequence_balanced_anchor_count(self):
         alpha = 0.5
         model = _make_model(
             self.logits,
@@ -678,12 +537,14 @@ class TestDFlashLosses(unittest.TestCase):
         )
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
         effective_weight = weight * self.binary_mask
-        weighted_sum = (self.neg_log_q * effective_weight).sum()
-        effective_weight_sum = effective_weight.sum()
-        token_loss = weighted_sum / effective_weight_sum
-        torch.testing.assert_close(got, token_loss, rtol=0, atol=1e-10)
-        torch.testing.assert_close(metrics["loss_terms"][0], weighted_sum)
-        torch.testing.assert_close(metrics["loss_terms"][1], effective_weight_sum)
+        numerator, denominator = _sequence_balanced_anchor_terms(
+            self.neg_log_q,
+            effective_weight,
+            self.binary_mask,
+        )
+        torch.testing.assert_close(got, numerator / denominator, rtol=0, atol=1e-10)
+        torch.testing.assert_close(metrics["loss_terms"][0], numerator)
+        torch.testing.assert_close(metrics["loss_terms"][1], denominator)
 
     def test_dpace_zero_effective_weight_has_finite_local_loss(self):
         logits = torch.zeros_like(self.logits)
@@ -704,7 +565,8 @@ class TestDFlashLosses(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(loss.item(), 0.0)
-        self.assertEqual(metrics["loss_terms"][1].item(), 0.0)
+        valid_sequences = (self.binary_mask > 0).any(dim=-1).any(dim=-1).sum().item()
+        self.assertEqual(metrics["loss_terms"][1].item(), valid_sequences)
 
     def test_alpha_changes_dpace_loss(self):
         low_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.1)

@@ -390,7 +390,12 @@ def build_dflash_model(
         lambda common: OnlineDFlashModel(
             **common,
             loss_type=cfg.training.loss_type,
-            dpace_alpha=cfg.training.dpace_alpha,
+            dpace_alpha=(
+                cfg.training.dpard_alpha
+                if cfg.training.loss_type == "dpard"
+                else cfg.training.dpace_alpha
+            ),
+            normalize_by_anchors=cfg.training.dflash_normalize_by_anchors,
             selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
             selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
@@ -440,8 +445,6 @@ def build_dspark_model(
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
-            loss_type=cfg.training.loss_type,
-            dpard_alpha=cfg.training.dpard_alpha,
         ),
     )
 

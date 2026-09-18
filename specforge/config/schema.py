@@ -291,6 +291,8 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Budget for one readiness probe, capped by the remaining startup timeout.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     #: Master key-lease TTL (ms) forwarded to ``mooncake_master
     #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
     #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
@@ -329,6 +331,10 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
+    #: None selects CUDA publication on RDMA in the capture worker.
+    gpu_put: Optional[bool] = None
+    #: SGLang's generation-based /health waits at least one second internally.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_devices(self):
@@ -372,6 +378,14 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        if any(server.gpu_put for server in self.capture_servers) and (
+            self.mooncake.protocol != "rdma"
+        ):
+            raise ValueError(
+                "managed_local capture_servers[].gpu_put needs mooncake.protocol "
+                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
+                "device memory"
+            )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
             raise ValueError(
@@ -427,6 +441,15 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: zero for both SpecForge roles.
     producer_segment_size: Optional[int] = Field(default=None, gt=0)
     client_buffer_size: int = Field(default=256 << 20, gt=0)
+    #: Consumer receive buffers for Mooncake ``get_into``: ``pageable`` allocates
+    #: a fresh host tensor per feature (registered and unregistered around each
+    #: read, then copied to the device on the training stream); ``pinned`` keeps
+    #: a bounded pool of page-locked, once-registered host buffers and copies to
+    #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
+    #: for device reads (Mooncake 0.3.x stages these through its client buffer).
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pinned"
+    #: Retained receive-pool budget per rank; excludes output copies and overflow.
+    receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
@@ -441,6 +464,16 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.receive_buffers == "cuda" and self.managed_local is not None:
+            # External deployments resolve environment overrides in the launch
+            # plan. Managed-local transport is authoritative over the environment.
+            if self.managed_local.mooncake.protocol != "rdma":
+                raise ValueError(
+                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
+                    "Mooncake transport (mooncake_protocol or "
+                    "managed_local.mooncake.protocol = rdma); the TCP transport "
+                    "cannot write into device memory"
+                )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir
@@ -573,6 +606,8 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    dpard_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    dflash_normalize_by_anchors: bool = False
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
@@ -587,7 +622,6 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
-    dpard_alpha: float = Field(default=0.5, gt=0.0, lt=1.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
@@ -617,12 +651,12 @@ class TrainingConfig(StrictConfigModel):
     @model_validator(mode="after")
     def _validate_training_shape(self):
         if self.loss_type == "dpard":
-            if self.strategy != "dspark":
-                raise ValueError("training.loss_type=dpard requires strategy=dspark")
-            if self.dspark_ce_loss_alpha != 0 or self.dspark_l1_loss_alpha != 0:
-                raise ValueError("D-PARD replaces CE/L1; set both loss alphas to zero")
+            if self.strategy != "dflash":
+                raise ValueError("training.loss_type=dpard requires strategy=dflash")
             if self.lk_loss_type is not None:
                 raise ValueError("D-PARD cannot be combined with LK loss")
+        if self.dflash_normalize_by_anchors and self.strategy != "dflash":
+            raise ValueError("anchor normalization requires strategy=dflash")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

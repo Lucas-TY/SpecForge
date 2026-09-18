@@ -89,6 +89,15 @@ servers. Its
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
+`qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
+its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
+in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+[runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
+server/trainer splits, Mooncake lease, in-flight watermarks and throughput
+measured on B300 and H200 nodes, and the two-node launcher that starts eight
+capture servers.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
@@ -154,12 +163,14 @@ assume the command runs from the repository root.
 | --- | --- |
 | EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](offline/colocated/qwen3-8b-eagle3-offline.yaml) |
 | DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
+| DFlash1 D-PARD offline, colocated | [`offline/colocated/qwen3-4b-dflash-dpard-offline.yaml`](offline/colocated/qwen3-4b-dflash-dpard-offline.yaml) |
 | Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
 | DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| DSpark D-PARD B16, offline colocated | [`offline/colocated/qwen3-4b-dspark-dpard-offline.yaml`](offline/colocated/qwen3-4b-dspark-dpard-offline.yaml) |
 | EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
+| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
 | Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 
 The runtime derives online/offline mode from the selected `data` source and
@@ -288,9 +299,9 @@ Strategy-specific fields should be written only when tuning that objective:
 | Strategy | Fields and defaults |
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
+| DFlash1 D-PARD | `training.loss_type: dpard`, `training.dpard_alpha` (`0.5`, in `[0, 1]`); requires final teacher states and automatically uses sequence-anchor reduction. `training.dflash_normalize_by_anchors` (`false`) optionally enables the same reduction for a static DFlash1 baseline. |
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
-| DSpark D-PARD | Set `training.loss_type` to `dpard` to replace CE/L1 with a D-PACE-weighted Rényi-half actor. Set both CE/L1 alphas to zero. `training.dpard_alpha` (`0.5`, strictly between 0 and 1) smooths exact-overlap position weights. Confidence predicts exact overlap and is weighted by cumulative reach; both terms use a valid-block mean. See the [recipe](../../docs/recipes/dpard.md). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
@@ -332,7 +343,9 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol such as `tcp` or `rdma`. |
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
-| `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. |
+| `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
+| `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
+| `deployment.disaggregated.receive_pool_bytes` | `8589934592` | Retained receive-pool budget per rank (`pinned`/`cuda`), excluding output copies and concurrent overflow. Failed-transfer buffers remain quarantined for the store lifetime. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
@@ -391,13 +404,38 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
+| `deployment.disaggregated.managed_local.mooncake.probe_timeout_s` | `5` | Positive, finite budget for one HTTP + TCP readiness probe, capped by the remaining startup timeout. |
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Automatically publish from CUDA memory when the capture worker uses RDMA. Set `false` to use host publication or `true` to require GPU publication; `true` requires `mooncake.protocol: rdma`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
+| `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
+
+`startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls
+each probe within that window. Increasing only the startup timeout cannot fix
+an HTTP probe timeout that is shorter than the server's healthy response time.
+The default probe budget supports SGLang's generation-based health check without
+disabling health-endpoint generation.
+
+Disaggregated Mooncake trainers use pinned receive pools without additional settings.
+With loader prefetch enabled, H2D runs in the loader before the batch reaches training.
+Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
+budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
+
+Patched CUDA capture servers use GPU publication automatically when
+`MOONCAKE_PROTOCOL=rdma`; TCP and non-CUDA workers use host publication. External
+servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly
+enable it. Managed-local `gpu_put: false` also disables an inherited enable flag.
+
+GPU publication retains a device snapshot until the asynchronous store write completes.
+Use RDMA-registerable CUDA allocations; with PyTorch, set
+`PYTORCH_ALLOC_CONF=expandable_segments:False` for capture servers if VMM allocations
+cannot be registered by the installed Mooncake/driver combination. Registration
+failures are reported before publishing refs.
 
 Managed-local is only for a fresh, single-node, online Mooncake run. It derives
 server URLs and Mooncake endpoints, so do not combine it with explicit external
@@ -502,6 +540,12 @@ For deeper lifecycle and recovery semantics, see the
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
+
+`qwen3-4b-dflash-dpard-offline.yaml` selects D-PARD for DFlash1: three draft
+layers, B16, and target layers `[1, 17, 33]`. Prepare its four-field cache with
+`prepare_hidden_states.py --strategy dflash --loss-type dpard`; ordinary
+three-field DFlash caches lack the required final teacher states. See the
+[D-PARD recipe](../../docs/recipes/dpard.md) for capture and training commands.
 
 DFlash 2 treats the token objective and position weighting as independent A/B
 axes. `training.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the

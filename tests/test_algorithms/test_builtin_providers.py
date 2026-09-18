@@ -26,43 +26,6 @@ BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
-    def test_dpard_resume_contract_records_objective_and_smoothing(self):
-        from specforge.algorithms.dspark.providers import resume_contract
-
-        draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=3), target_layer_ids=[1, 17, 33]
-        )
-        model = SimpleNamespace(
-            block_size=16,
-            mask_token_id=1,
-            attention_backend="sdpa",
-            num_anchors=512,
-            loss_decay_gamma=7.0,
-            dspark_ce_loss_alpha=0.0,
-            dspark_l1_loss_alpha=0.0,
-            dspark_confidence_head_alpha=1.0,
-            loss_type="dpard",
-            dpace_alpha=0.5,
-        )
-        first = resume_contract(None, draft, model)
-        self.assertEqual(first["dspark_loss_type"], "dpard")
-        self.assertEqual(first["dpard_alpha"], 0.5)
-        self.assertEqual(first["dpard_actor_reduction"], "valid_block_mean")
-        self.assertEqual(first["dpard_confidence_weighting"], "cumulative_reach")
-        self.assertEqual(first["dpard_confidence_reduction"], "valid_block_mean")
-        model.dpace_alpha = 0.75
-        self.assertNotEqual(first, resume_contract(None, draft, model))
-        model.loss_type = "dspark"
-        self.assertNotIn("dspark_loss_type", resume_contract(None, draft, model))
-
-    def test_dpard_step_options_detect_disabling_on_resume(self):
-        step = builtin_algorithm_registry().resolve("dspark").providers.step
-        config = SimpleNamespace(training=SimpleNamespace(loss_type="dflash"))
-        original = step.options(config)
-        self.assertEqual(original, {})
-        config.training.loss_type = "dpard"
-        self.assertNotEqual(original, step.options(config))
-
     def setUp(self):
         self.registry = builtin_algorithm_registry()
 
@@ -302,6 +265,54 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 contract = step.resume_contract(config, draft, models[name])
                 self.assertTrue(expected_keys[name] <= contract.keys())
                 self.assertTrue(all(key.startswith(f"{name}_") for key in contract))
+
+    def test_dflash_resume_contract_preserves_legacy_keys_and_marks_static_opt_in(self):
+        draft = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=3), target_layer_ids=[1, 17, 33]
+        )
+        model = SimpleNamespace(
+            block_size=16,
+            mask_token_id=0,
+            attention_backend="sdpa",
+            num_anchors=512,
+            loss_decay_gamma=7.0,
+            loss_type="dflash",
+            dpace_alpha=0.5,
+            normalize_by_anchors=False,
+            lk_loss_type=None,
+            kl_scale=1.0,
+            kl_decay=1.0,
+        )
+        legacy = {
+            "dflash_draft_num_hidden_layers": 3,
+            "dflash_target_layer_ids": (1, 17, 33),
+            "dflash_block_size": 16,
+            "dflash_mask_token_id": 0,
+            "dflash_attention_backend": "sdpa",
+            "dflash_num_anchors": 512,
+            "dflash_loss_decay_gamma": 7.0,
+            "dflash_loss_type": "dflash",
+            "dflash_dpace_alpha": 0.5,
+            "dflash_lk_loss_type": None,
+            "dflash_kl_scale": 1.0,
+            "dflash_kl_decay": 1.0,
+        }
+        resume = self.registry.resolve("dflash").providers.step.resume_contract
+        self.assertEqual(resume(None, draft, model), legacy)
+        model.normalize_by_anchors = True
+        anchored = resume(None, draft, model)
+        self.assertEqual(anchored, {**legacy, "dflash_loss_type": "dflash-anchor"})
+        # Trainer compares every current key: both resume directions differ.
+        for saved, current in ((legacy, anchored), (anchored, legacy)):
+            self.assertEqual(
+                {key for key in current if saved.get(key) != current[key]},
+                {"dflash_loss_type"},
+            )
+        for loss_type in ("dpace", "dpard"):
+            model.loss_type = loss_type
+            self.assertEqual(
+                resume(None, draft, model), {**legacy, "dflash_loss_type": loss_type}
+            )
 
     def test_step_runtime_config_binds_options_contract_and_missing_key_policy(self):
         step = self.registry.resolve("eagle3").providers.step
